@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import time
+import threading
+import os
+from datetime import datetime
+import sqlite3
+
+import RPi.GPIO as GPIO
+from flask import Flask, Response, render_template_string, redirect, url_for
+import json
+
+###############################################################################
+# Configuration GPIO et capteur
+###############################################################################
+BROCHE_CAPTEUR = 17
+DELAI_ARRET = 10.0
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BROCHE_CAPTEUR, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+###############################################################################
+# Gestion 3×8
+###############################################################################
+def get_current_poste():
+    """
+    Postes :
+      1 : 05h -> 13h
+      2 : 13h -> 21h
+      3 : 21h -> 05h (lendemain)
+    """
+    now = datetime.now()
+    h = now.hour
+    if 5 <= h < 13:
+        return 1
+    elif 13 <= h < 21:
+        return 2
+    else:
+        return 3
+
+###############################################################################
+# Base de données SQLite : supervision.db
+###############################################################################
+DB_PATH = "/home/pi/supervision.db"
+
+def init_db():
+    """
+    Crée la table 'historique' si elle n'existe pas.
+    Table pour enregistrer : [id, horodatage, poste, temps_ouverture_min, nb_arrets, mtbf_min]
+    """
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS historique (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            horodatage TEXT,
+            poste INTEGER,
+            temps_ouverture_min REAL,
+            nombre_arrets INTEGER,
+            mtbf_min REAL
+        );
+    """)
+    con.commit()
+    con.close()
+
+def insert_record(poste, temps_ouverture, nombre_arrets, mtbf):
+    """
+    Insère un enregistrement dans la table 'historique'.
+    """
+    horodatage = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO historique (horodatage, poste, temps_ouverture_min, nombre_arrets, mtbf_min)
+        VALUES (?, ?, ?, ?, ?);
+    """, (horodatage, poste, temps_ouverture, nombre_arrets, mtbf))
+    con.commit()
+    con.close()
+
+def get_last_records(limit=6):
+    """
+    Récupère les 'limit' derniers enregistrements, ordonnés par id desc
+    (pour afficher l'historique). On en prend 6 pour la démonstration.
+    """
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT horodatage, poste, temps_ouverture_min, nombre_arrets, mtbf_min
+        FROM historique
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+###############################################################################
+# Variables globales (protégées par un verrou)
+###############################################################################
+import threading
+data_lock = threading.Lock()
+
+data = {
+    "ligne_active": False,
+    "poste_actuel": 0,
+    "temps_demarrage": 0.0,       # stocké en SECONDES
+    "temps_ouverture": 0.0,       # SECONDES
+    "nombre_arrets": 0,
+    "derniere_detection": None
+}
+
+# Pour stocker en mémoire les 2 derniers postes terminés (affichage SSE).
+historique_postes_ram = []
+
+###############################################################################
+# Fonctions Fin de Poste
+###############################################################################
+def fin_de_poste():
+    """
+    Appelée en fin de poste => on fige le temps d'ouverture,
+    on calcule MTBF, on insère dans la DB, on stocke dans 'historique_postes_ram',
+    on reset pour le nouveau poste.
+    """
+    final_ouverture_s = 0.0
+    arrets = 0
+    if data["ligne_active"]:
+        final_ouverture_s = time.time() - data["temps_demarrage"]
+        arrets = data["nombre_arrets"]
+
+    final_ouverture_min = final_ouverture_s / 60.0
+    if arrets > 0:
+        mtbf_final = final_ouverture_min / arrets
+    else:
+        mtbf_final = 0.0
+
+    # Enregistrement dans SQLite
+    insert_record(
+        data["poste_actuel"],
+        round(final_ouverture_min, 2),
+        arrets,
+        round(mtbf_final, 2)
+    )
+
+    # Stocker en mémoire
+    info_poste = {
+        "poste": data["poste_actuel"],
+        "fin": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mtbf": round(mtbf_final, 2),
+        "arrets": arrets
+    }
+    historique_postes_ram.insert(0, info_poste)
+    while len(historique_postes_ram) > 2:
+        historique_postes_ram.pop()
+
+    # Reset
+    data["temps_ouverture"] = 0.0
+    data["nombre_arrets"] = 0
+    data["derniere_detection"] = None
+    if data["ligne_active"]:
+        data["temps_demarrage"] = time.time()
+    else:
+        data["temps_demarrage"] = 0.0
+
+###############################################################################
+# Manager 3x8
+###############################################################################
+def shift_manager():
+    current_poste = get_current_poste()
+    with data_lock:
+        data["poste_actuel"] = current_poste
+
+    while True:
+        time.sleep(60)
+        new_poste = get_current_poste()
+        with data_lock:
+            if new_poste != data["poste_actuel"]:
+                fin_de_poste()
+                data["poste_actuel"] = new_poste
+                if data["ligne_active"]:
+                    data["temps_demarrage"] = time.time()
+
+###############################################################################
+# Surveillance du capteur
+###############################################################################
+def surveillance_capteur():
+    while True:
+        etat_capteur = GPIO.input(BROCHE_CAPTEUR)
+        maintenant = time.time()
+        with data_lock:
+            if data["ligne_active"]:
+                if etat_capteur == 0:
+                    data["derniere_detection"] = maintenant
+                else:
+                    if data["derniere_detection"] is not None:
+                        ecart = maintenant - data["derniere_detection"]
+                        if ecart >= 10.0:
+                            data["nombre_arrets"] += 1
+                            data["derniere_detection"] = None
+        time.sleep(0.1)
+
+###############################################################################
+# Flask + SSE
+###############################################################################
+from flask import Flask, Response, render_template_string, redirect, url_for
+
+app = Flask(__name__)
+
+# Nous ajoutons un petit menu (HTML/CSS) + un style un peu plus poussé
+page_html = """
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Supervision 3x8 SQLite (MTBF)</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f4f4f4;
+      }
+      header {
+        background: #333; color: white; padding: 10px;
+      }
+      nav a {
+        color: #fff; margin-right: 15px; text-decoration: none;
+      }
+      .container {
+        max-width: 800px; margin: 20px auto; background: #fff; padding: 20px; border-radius: 8px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+      }
+      h1 { text-align: center; }
+      .stats p { font-weight: bold; }
+      .button-container { text-align: center; margin-top: 20px; }
+      button {
+        padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 15px;
+      }
+      .btn-start { background-color: #4CAF50; color: #fff; }
+      .btn-stop { background-color: #f44336; color: #fff; }
+      .footer { text-align: center; color: #777; margin-top: 30px; font-size: 0.9rem; }
+
+      /* Jauge */
+      .gauge-container {
+        margin: 20px auto;
+        width: 200px; height: 100px; position: relative;
+      }
+      .gauge-base {
+        width: 200px; height: 100px; background: #eee; border-radius: 100px 100px 0 0;
+        overflow: hidden; position: relative;
+      }
+      .gauge-fill {
+        width: 200px; height: 200px; background: linear-gradient(to right, green, yellow, red);
+        position: absolute; bottom: 0; left: 0; transform-origin: 50% 100%; transform: rotate(0deg);
+      }
+      .gauge-cover {
+        width: 160px; height: 80px; background: #fff; border-radius: 80px 80px 0 0;
+        position: absolute; bottom: 0; left: 20px;
+      }
+
+      table {
+        width: 100%; border-collapse: collapse; margin-top: 20px;
+      }
+      th, td {
+        padding: 8px; border: 1px solid #ccc; text-align: center;
+      }
+      .navlinks {
+        margin-top: 5px;
+      }
+    </style>
+</head>
+<body>
+
+<header>
+  <nav class="navlinks">
+    <a href="{{ url_for('index') }}">Dashboard</a>
+    <a href="{{ url_for('historique_page') }}">Historique Complet</a>
+  </nav>
+</header>
+
+<div class="container">
+    <h1>Supervision 3×8 (SQLite / MTBF en minutes)</h1>
+
+    <div class="stats">
+        <p>Poste actuel : <span id="poste_actuel"></span></p>
+        <p>Temps d'ouverture (minutes) : <span id="temps_ouverture"></span></p>
+        <p>Nombre d'arrêts : <span id="nombre_arrets"></span></p>
+        <p>MTBF (minutes) : <span id="mtbf"></span></p>
+    </div>
+
+    <div class="gauge-container">
+        <div class="gauge-base">
+            <div class="gauge-fill" id="gauge-fill"></div>
+            <div class="gauge-cover"></div>
+        </div>
+    </div>
+
+    <div class="button-container">
+        {% if not ligne_active %}
+        <form action="{{ url_for('demarrer_ligne') }}" method="post">
+            <button type="submit" class="btn-start">Démarrer la ligne</button>
+        </form>
+        {% else %}
+        <form action="{{ url_for('arreter_ligne') }}" method="post">
+            <button type="submit" class="btn-stop">Arrêter la ligne (manuel)</button>
+        </form>
+        {% endif %}
+
+        <a href="{{ url_for('historique_page') }}">
+            <button>Voir Historique</button>
+        </a>
+    </div>
+
+    <div class="footer">
+        <p>Supervision © 2025</p>
+    </div>
+</div>
+
+<script>
+  var source = new EventSource("/stream");
+  source.onmessage = function(event) {
+    var info = JSON.parse(event.data);
+
+    document.getElementById("poste_actuel").textContent = info.poste_actuel;
+    document.getElementById("temps_ouverture").textContent = info.temps_ouverture;
+    document.getElementById("nombre_arrets").textContent = info.nombre_arrets;
+    document.getElementById("mtbf").textContent = info.mtbf;
+
+    let gaugeFill = document.getElementById("gauge-fill");
+    let mtbfVal = parseFloat(info.mtbf);
+    if(mtbfVal > 30) mtbfVal = 30;
+    if(mtbfVal < 0) mtbfVal = 0;
+    let angle = (mtbfVal / 30) * 180;
+    gaugeFill.style.transform = "rotate(" + angle + "deg)";
+  };
+</script>
+
+</body>
+</html>
+"""
+
+# Page historique pour voir la DB
+page_html_histo = """
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Historique complet</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f4f4f4; }
+      header { background: #333; color: white; padding: 10px; }
+      nav a { color: #fff; margin-right: 15px; text-decoration: none; }
+      .container {
+        max-width: 800px; margin: 20px auto; background: #fff; padding: 20px;
+        border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1);
+      }
+      h1 { text-align: center; }
+      table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+      th, td { padding: 8px; border: 1px solid #ccc; text-align: center; }
+      .footer { text-align: center; color: #777; margin-top: 30px; font-size: 0.9rem; }
+      .navlinks { margin-top: 5px; }
+    </style>
+</head>
+<body>
+
+<header>
+  <nav class="navlinks">
+    <a href="{{ url_for('index') }}">Dashboard</a>
+    <a href="{{ url_for('historique_page') }}">Historique Complet</a>
+  </nav>
+</header>
+
+<div class="container">
+  <h1>Historique Complet (SQLite)</h1>
+  <table>
+    <thead>
+      <tr>
+        <th>Horodatage</th>
+        <th>Poste</th>
+        <th>Temps_ouverture_min</th>
+        <th>Nb_arrêts</th>
+        <th>MTBF_min</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for row in rows %}
+      <tr>
+        <td>{{ row[0] }}</td> <!-- horodatage -->
+        <td>{{ row[1] }}</td> <!-- poste -->
+        <td>{{ row[2] }}</td> <!-- temps_ouverture -->
+        <td>{{ row[3] }}</td> <!-- nombre_arrets -->
+        <td>{{ row[4] }}</td> <!-- mtbf -->
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="footer">
+    <p>Supervision © 2025</p>
+  </div>
+</div>
+
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    with data_lock:
+        return render_template_string(
+            page_html,
+            ligne_active=data["ligne_active"]
+        )
+
+@app.route("/stream")
+def stream():
+    """
+    Flux SSE => envoie en temps réel :
+     - poste_actuel
+     - temps_ouverture (min)
+     - nombre_arrets
+     - mtbf
+    """
+    def event_stream():
+        while True:
+            with data_lock:
+                poste = data["poste_actuel"]
+                temps_s = data["temps_ouverture"]
+                if data["ligne_active"]:
+                    temps_s = time.time() - data["temps_demarrage"]
+                temps_m = temps_s / 60.0
+                nb_arr = data["nombre_arrets"]
+                if nb_arr > 0:
+                    mtbf_val = temps_m / nb_arr
+                else:
+                    mtbf_val = 0.0
+
+                infos = {
+                    "poste_actuel": poste,
+                    "temps_ouverture": round(temps_m, 2),
+                    "nombre_arrets": nb_arr,
+                    "mtbf": round(mtbf_val, 2)
+                }
+            yield "data: " + json.dumps(infos) + "\n\n"
+            time.sleep(1)
+    return Response(event_stream(), mimetype="text/event-stream")
+
+@app.route("/demarrer", methods=["POST"])
+def demarrer_ligne():
+    with data_lock:
+        if not data["ligne_active"]:
+            data["ligne_active"] = True
+            data["temps_demarrage"] = time.time()
+            data["nombre_arrets"] = 0
+            data["derniere_detection"] = None
+    return redirect(url_for("index"))
+
+@app.route("/arreter", methods=["POST"])
+def arreter_ligne():
+    with data_lock:
+        if data["ligne_active"]:
+            fin_de_poste()
+            data["ligne_active"] = False
+            data["poste_actuel"] = get_current_poste()
+    return redirect(url_for("index"))
+
+@app.route("/historique")
+def historique_page():
+    """
+    Page pour afficher l'historique complet (limité à X enregistrements)
+    """
+    rows = get_last_records(limit=20)  # On prend 20 dernier enregistrements par ex
+    return render_template_string(page_html_histo, rows=rows)
+
+###############################################################################
+# Programme principal
+###############################################################################
+if __name__ == "__main__":
+    # Crée la table si besoin
+    init_db()
+
+    # Threads
+    thread_capteur = threading.Thread(target=surveillance_capteur, daemon=True)
+    thread_capteur.start()
+
+    thread_shift = threading.Thread(target=shift_manager, daemon=True)
+    thread_shift.start()
+
+    # Init
+    with data_lock:
+        data["poste_actuel"] = get_current_poste()
+
+    # Lancement
+    app.run(host="0.0.0.0", port=5000, debug=False)
